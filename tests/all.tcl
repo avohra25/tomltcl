@@ -367,9 +367,148 @@ test bool-not-ident {true as key ok} -body {
     ::tomltcl::tv_data [dict get [rootdict {true = false}] true]
 } -result 0
 
+
+# --- stage 2: encode / round-trip ---
+test enc-simple {encode simple} -body {
+    set doc [::tomltcl::parse {a = 1
+b = "x"}]
+    set s [::tomltcl::encode $doc]
+    set d2 [::tomltcl::tv_data [::tomltcl::parse $s]]
+    list [::tomltcl::tv_data [dict get $d2 a]] [::tomltcl::tv_data [dict get $d2 b]]
+} -result {1 x}
+
+test enc-sorted {stable key ordering} -body {
+    set doc [::tomltcl::parse {z = 1
+a = 2}]
+    set s [::tomltcl::encode $doc -sorted 1]
+    # a should appear before z
+    expr {[string first a $s] < [string first z $s]}
+} -result 1
+
+test enc-bool-float {encode bool float} -body {
+    set doc [::tomltcl::tv table [dict create \
+        t [::tomltcl::tv bool 1] \
+        f [::tomltcl::tv float 1.5] \
+        n [::tomltcl::tv float nan]]]
+    set s [::tomltcl::encode $doc]
+    set d [::tomltcl::tv_data [::tomltcl::parse $s]]
+    list [::tomltcl::tv_data [dict get $d t]] \
+         [::tomltcl::tv_data [dict get $d f]] \
+         [::tomltcl::tv_data [dict get $d n]]
+} -result {1 1.5 nan}
+
+test enc-array {encode array} -body {
+    set doc [::tomltcl::parse {a = [1, 2, 3]}]
+    set s [::tomltcl::encode $doc]
+    llength [::tomltcl::tv_data [dict get [::tomltcl::tv_data [::tomltcl::parse $s]] a]]
+} -result 3
+
+test enc-table {encode standard table} -body {
+    set doc [::tomltcl::parse {
+[server]
+host = "localhost"
+}]
+    set s [::tomltcl::encode $doc]
+    set d [::tomltcl::tv_data [::tomltcl::parse $s]]
+    ::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get $d server]] host]
+} -result localhost
+
+test enc-aot {encode array of tables} -body {
+    set doc [::tomltcl::parse {
+[[p]]
+n = "A"
+[[p]]
+n = "B"
+}]
+    set s [::tomltcl::encode $doc]
+    set arr [::tomltcl::tv_data [dict get [::tomltcl::tv_data [::tomltcl::parse $s]] p]]
+    list [llength $arr] [::tomltcl::tv_data [dict get [::tomltcl::tv_data [lindex $arr 1]] n]]
+} -result {2 B}
+
+test enc-escape {encode escapes} -body {
+    set doc [::tomltcl::tv table [dict create s [::tomltcl::tv string "a\nb\"c\\"]]]
+    set s [::tomltcl::encode $doc]
+    ::tomltcl::tv_data [dict get [::tomltcl::tv_data [::tomltcl::parse $s]] s]
+} -result "a\nb\"c\\"
+
+test enc-datetime {encode datetime} -body {
+    set doc [::tomltcl::parse {d = 2020-01-01T00:00:00Z}]
+    set s [::tomltcl::encode $doc]
+    list [::tomltcl::tv_type [dict get [::tomltcl::tv_data [::tomltcl::parse $s]] d]] \
+         [::tomltcl::tv_data [dict get [::tomltcl::tv_data [::tomltcl::parse $s]] d]]
+} -result {datetime 2020-01-01T00:00:00Z}
+
+test enc-inline-roundtrip {inline table roundtrip via encode} -body {
+    set doc [::tomltcl::parse {p = {x = 1, y = 2}}]
+    # encode may expand to [p] table form
+    set s [::tomltcl::encode $doc]
+    set d [::tomltcl::tv_data [::tomltcl::parse $s]]
+    list [::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get $d p]] x]] \
+         [::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get $d p]] y]]
+} -result {1 2}
+
+test enc-stringify {stringify alias} -body {
+    string length [::tomltcl::stringify [::tomltcl::parse {a = 1}]]
+} -match glob -result {[1-9]*}
+
+test enc-ml-string {multiline string choice} -body {
+    set long "line1\nline2\nline3\nline4\nline5\nextra text here!!"
+    set doc [::tomltcl::tv table [dict create s [::tomltcl::tv string $long]]]
+    set s [::tomltcl::encode $doc]
+    expr {[string first {"""} $s] >= 0}
+} -result 1
+
+test enc-empty {empty doc} -body {
+    ::tomltcl::encode [::tomltcl::tv table [dict create]]
+} -result {}
+
+test roundtrip-property {parse-encode-parse several docs} -body {
+    set samples {
+        {a = 1}
+        {s = "hi"
+n = 3.5
+b = true}
+        {[t]
+x = 1}
+        {[[a]]
+k = 1
+[[a]]
+k = 2}
+        {arr = [1, "two", false]}
+        {d = 2021-06-15
+t = 08:30:00}
+    }
+    set ok 1
+    foreach sample $samples {
+        set d1 [::tomltcl::parse $sample]
+        set enc [::tomltcl::encode $d1]
+        set d2 [::tomltcl::parse $enc]
+        if {[::tomltcl::dump $d1] ne [::tomltcl::dump $d2]} {
+            set ok 0
+            break
+        }
+    }
+    set ok
+} -result 1
+
+test ml-nested-inline {nested inline tables} -body {
+    set d [rootdict {a = {b = {c = 1}}}]
+    ::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get $d a]] b]] c]
+} -result 1
+
+test aot-edge-empty-then-key {aot then keys} -body {
+    set d [rootdict {
+[[x]]
+[[x]]
+a = 1
+}]
+    set arr [::tomltcl::tv_data [dict get $d x]]
+    list [llength $arr] [::tomltcl::tv_data [dict get [::tomltcl::tv_data [lindex $arr 1]] a]]
+} -result {2 1}
+
+
 puts ""
+set ::_failed $::tcltest::numTests(Failed)
 cleanupTests
-if {$::tcltest::numTests(Failed) > 0} {
-    exit 1
-}
+if {$_failed > 0} { exit 1 }
 exit 0

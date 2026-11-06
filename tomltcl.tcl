@@ -949,7 +949,7 @@ proc ::tomltcl::dump {value {indent 0}} {
             if {$d} { return "bool(true)" }
             return "bool(false)"
         }
-        datetime - datetime-local - date - time { return "$t($d)" }
+        datetime - datetime-local - date - time { return [format {%s(%s)} $t $d] }
         array {
             if {[llength $d] == 0} { return "array\[\]" }
             set lines [list "array\["]
@@ -973,16 +973,219 @@ proc ::tomltcl::dump {value {indent 0}} {
     }
 }
 
-proc ::tomltcl::encode {doc args} {
-    return -code error "tomltcl::encode not implemented in 0.1.0 core; see later stages"
+
+# ---------------------------------------------------------------------------
+# Encoder
+# ---------------------------------------------------------------------------
+proc ::tomltcl::_is_bare_key {k} {
+    expr {[regexp {^[A-Za-z0-9_\-]+$} $k]}
 }
-proc ::tomltcl::stringify {doc args} { encode $doc {*}$args }
+
+proc ::tomltcl::_encode_key {k} {
+    if {[::tomltcl::_is_bare_key $k]} { return $k }
+    return [::tomltcl::_encode_basic_string $k]
+}
+
+proc ::tomltcl::_encode_basic_string {s} {
+    set out "\""
+    foreach ch [split $s {}] {
+        set o [scan $ch %c]
+        switch -exact -- $ch {
+            \" { append out "\\\"" }
+            \\ { append out "\\\\" }
+            \b { append out "\\b" }
+            \t { append out "\\t" }
+            \n { append out "\\n" }
+            \f { append out "\\f" }
+            \r { append out "\\r" }
+            default {
+                if {$o < 0x20} {
+                    append out [format "\\u%04x" $o]
+                } else {
+                    append out $ch
+                }
+            }
+        }
+    }
+    append out "\""
+    return $out
+}
+
+proc ::tomltcl::_prefer_multiline {s} {
+    expr {[string first \n $s] >= 0 && [string length $s] > 20}
+}
+
+proc ::tomltcl::_encode_ml_basic {s} {
+    # Use multiline basic string; escape only what we must
+    set body $s
+    # Escape sequences that would break out
+    set body [string map {"\\" "\\\\"} $body]
+    # Avoid """ in content by escaping quotes near triples - simple: escape all "
+    set body [string map {"\"" "\\\""} $body]
+    return "\"\"\"\n$body\"\"\""
+}
+
+proc ::tomltcl::_encode_string {s args} {
+    set prefer_ml 0
+    if {[lsearch -exact $args -multiline] >= 0} { set prefer_ml 1 }
+    if {$prefer_ml || [::tomltcl::_prefer_multiline $s]} {
+        return [::tomltcl::_encode_ml_basic $s]
+    }
+    ::tomltcl::_encode_basic_string $s
+}
+
+proc ::tomltcl::_encode_float {d} {
+    if {$d eq "nan" || $d eq "inf" || $d eq "-inf"} { return $d }
+    # Ensure a decimal point for whole floats so they stay floats
+    set s [expr {$d}]
+    if {[regexp {^-?[0-9]+$} $s]} { append s .0 }
+    return $s
+}
+
+proc ::tomltcl::_encode_value {v {inline 0}} {
+    set t [tv_type $v]
+    set d [tv_data $v]
+    switch -exact -- $t {
+        string {
+            if {$inline} { return [::tomltcl::_encode_basic_string $d] }
+            return [::tomltcl::_encode_string $d]
+        }
+        integer { return $d }
+        float { return [::tomltcl::_encode_float $d] }
+        bool { return [expr {$d ? "true" : "false"}] }
+        datetime - datetime-local - date - time { return $d }
+        array {
+            if {[llength $d] == 0} { return "\[\]" }
+            # Heuristic: use multiline if nested tables/arrays or long
+            set parts {}
+            set complex 0
+            foreach item $d {
+                set it [tv_type $item]
+                if {$it eq "array" || $it eq "table"} { set complex 1 }
+                lappend parts [::tomltcl::_encode_value $item 1]
+            }
+            if {$complex || [llength $d] > 4} {
+                set lines "\["
+                foreach p $parts {
+                    append lines "\n  " $p ","
+                }
+                append lines "\n\]"
+                return $lines
+            }
+            return "\[[join $parts {, }]\]"
+        }
+        table {
+            # Inline table encoding
+            if {[dict size $d] == 0} { return "\{\}" }
+            set parts {}
+            foreach k [lsort [dict keys $d]] {
+                set vv [dict get $d $k]
+                lappend parts "[::tomltcl::_encode_key $k] = [::tomltcl::_encode_value $vv 1]"
+            }
+            return "\{[join $parts {, }]\}"
+        }
+        default { return -code error "cannot encode type $t" }
+    }
+}
+
+proc ::tomltcl::_table_is_aot_only {d} {
+    # true if table has only array-of-tables children? not needed
+    return 0
+}
+
+proc ::tomltcl::_encode_table_body {path d sorted linesVar aotVar} {
+    upvar 1 $linesVar lines
+    upvar 1 $aotVar aots
+    # Emit simple key/values first, then nested tables, collect AOTs
+    set keys [dict keys $d]
+    if {$sorted} { set keys [lsort $keys] }
+
+    set simple {}
+    set subtabl {}
+    set aotkeys {}
+    foreach k $keys {
+        set v [dict get $d $k]
+        set t [tv_type $v]
+        if {$t eq "table"} {
+            lappend subtabl $k
+        } elseif {$t eq "array"} {
+            set arr [tv_data $v]
+            set all_tables 1
+            if {[llength $arr] == 0} { set all_tables 0 }
+            foreach item $arr {
+                if {[tv_type $item] ne "table"} { set all_tables 0; break }
+            }
+            if {$all_tables} {
+                lappend aotkeys $k
+            } else {
+                lappend simple $k
+            }
+        } else {
+            lappend simple $k
+        }
+    }
+
+    foreach k $simple {
+        set v [dict get $d $k]
+        lappend lines "[::tomltcl::_encode_key $k] = [::tomltcl::_encode_value $v]"
+    }
+    foreach k $subtabl {
+        set child [tv_data [dict get $d $k]]
+        set subpath [concat $path [list $k]]
+        set header [join [lmap p $subpath {::tomltcl::_encode_key $p}] .]
+        lappend lines ""
+        lappend lines "\[$header\]"
+        ::tomltcl::_encode_table_body $subpath $child $sorted lines aots
+    }
+    foreach k $aotkeys {
+        set arr [tv_data [dict get $d $k]]
+        set subpath [concat $path [list $k]]
+        set header [join [lmap p $subpath {::tomltcl::_encode_key $p}] .]
+        foreach item $arr {
+            lappend lines ""
+            lappend lines "\[\[$header\]\]"
+            ::tomltcl::_encode_table_body $subpath [tv_data $item] $sorted lines aots
+        }
+    }
+}
+
+proc ::tomltcl::encode {doc args} {
+    set sorted 1
+    set style dotted
+    foreach {opt val} $args {
+        switch -exact -- $opt {
+            -sorted { set sorted [expr {!!$val}] }
+            -sort { set sorted [expr {!!$val}] }
+            -style { set style $val }
+            default { return -code error "unknown encode option $opt" }
+        }
+    }
+    if {[tv_type $doc] ne "table"} {
+        return -code error "encode expects a root table value"
+    }
+    set d [tv_data $doc]
+    set lines {}
+    set aots {}
+    ::tomltcl::_encode_table_body {} $d $sorted lines aots
+    # Trim leading blank lines
+    while {[llength $lines] && [lindex $lines 0] eq ""} {
+        set lines [lrange $lines 1 end]
+    }
+    set out [join $lines \n]
+    if {$out ne ""} { append out \n }
+    return $out
+}
+
+proc ::tomltcl::stringify {doc args} {
+    encode $doc {*}$args
+}
+
 proc ::tomltcl::get {doc path} {
-    return -code error "tomltcl::get not implemented in 0.1.0 core; see later stages"
+    return -code error "tomltcl::get not implemented yet; see stage 3"
 }
 proc ::tomltcl::exists {doc path} {
-    return -code error "tomltcl::exists not implemented in 0.1.0 core; see later stages"
+    return -code error "tomltcl::exists not implemented yet; see stage 3"
 }
 proc ::tomltcl::to_json {doc} {
-    return -code error "tomltcl::to_json not implemented in 0.1.0 core; see later stages"
+    return -code error "tomltcl::to_json not implemented yet; see stage 3"
 }

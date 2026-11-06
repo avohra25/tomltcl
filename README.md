@@ -2,14 +2,15 @@
 
 Pure **Tcl 8.6** toolkit for [TOML 1.0.0](https://toml.io/en/v1.0.0). No Critcl, tdom, or tcllib required at runtime (`tcltest` is used only for tests).
 
-## Features (0.1.0)
+## Features (0.1.0 + encode)
 
 - Lexer + recursive-descent parser for TOML 1.0.0 values and documents
 - Keys (bare, quoted, dotted), basic/literal/multiline strings, integers (hex/oct/bin + underscores), floats (`inf`/`nan`), booleans
 - Offset and local datetimes, local dates and times
 - Arrays, inline tables, standard tables, array-of-tables
 - Strict duplicate-key / table-conflict detection with line:column errors
-- Typed document model for faithful round-trips (later stages add encode/JSON)
+- Typed document model for faithful round-trips
+- `tomltcl::encode` / `tomltcl::stringify` with sorted keys and multiline-string heuristics
 
 ## Document model
 
