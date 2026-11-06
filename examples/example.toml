@@ -1,0 +1,10 @@
+# Simple example
+title = "tomltcl"
+
+[owner]
+name = "Aryan Vohra"
+dob = 2005-01-01
+
+[database]
+ports = [8001, 8002, 8003]
+enabled = true
