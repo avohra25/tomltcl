@@ -507,6 +507,183 @@ a = 1
 } -result {2 1}
 
 
+
+# --- stage 3: get / exists / to_json / more invalid ---
+test get-simple {get simple key} -body {
+    set doc [::tomltcl::parse {a = 42}]
+    ::tomltcl::tv_data [::tomltcl::get $doc a]
+} -result 42
+
+test get-dotted {get dotted path} -body {
+    set doc [::tomltcl::parse {
+[a.b]
+c = 7
+}]
+    ::tomltcl::tv_data [::tomltcl::get $doc a.b.c]
+} -result 7
+
+test get-array-index {get array index via list path} -body {
+    set doc [::tomltcl::parse {a = [10, 20, 30]}]
+    ::tomltcl::tv_data [::tomltcl::get $doc {a 1}]
+} -result 20
+
+test get-aot {get aot element} -body {
+    set doc [::tomltcl::parse {
+[[x]]
+n = "A"
+[[x]]
+n = "B"
+}]
+    ::tomltcl::tv_data [::tomltcl::get $doc {x 1 n}]
+} -result B
+
+test get-missing {get missing errors} -body {
+    set doc [::tomltcl::parse {a = 1}]
+    expr {[catch {::tomltcl::get $doc z}] == 1}
+} -result 1
+
+test exists-true {exists true} -body {
+    ::tomltcl::exists [::tomltcl::parse {a = 1}] a
+} -result 1
+
+test exists-false {exists false} -body {
+    ::tomltcl::exists [::tomltcl::parse {a = 1}] b
+} -result 0
+
+test exists-nested {exists nested} -body {
+    ::tomltcl::exists [::tomltcl::parse {
+[t]
+x = 1
+}] t.x
+} -result 1
+
+test json-object {to_json object} -body {
+    set doc [::tomltcl::parse {a = 1
+b = "x"
+c = true}]
+    ::tomltcl::to_json $doc
+} -result {{"a":1,"b":"x","c":true}}
+
+test json-array {to_json array} -body {
+    set doc [::tomltcl::parse {a = [1, 2]}]
+    ::tomltcl::to_json $doc
+} -result {{"a":[1,2]}}
+
+test json-datetime {to_json datetime as string} -body {
+    set doc [::tomltcl::parse {d = 2020-01-01}]
+    ::tomltcl::to_json $doc
+} -result {{"d":"2020-01-01"}}
+
+test json-escape {to_json escapes} -body {
+    set doc [::tomltcl::tv table [dict create s [::tomltcl::tv string "a\"b"]]]
+    ::tomltcl::to_json $doc
+} -result {{"s":"a\"b"}}
+
+test json-nested {to_json nested table} -body {
+    set doc [::tomltcl::parse {
+[t]
+x = 1
+}]
+    ::tomltcl::to_json $doc
+} -result {{"t":{"x":1}}}
+
+test json-nan {nan becomes null} -body {
+    set doc [::tomltcl::tv table [dict create n [::tomltcl::tv float nan]]]
+    ::tomltcl::to_json $doc
+} -result {{"n":null}}
+
+# more invalid document rejection
+test inv-bare-newline-string {newline in basic string} -body {
+    expr {[catch {::tomltcl::parse "a = \"hi\nthere\""}] == 1}
+} -result 1
+
+test inv-trailing-inline {trailing comma inline} -body {
+    expr {[catch {::tomltcl::parse {a = {b = 1,}}}] == 1}
+} -result 1
+
+test inv-unclosed-array {unclosed array} -body {
+    expr {[catch {::tomltcl::parse {a = [1, 2}}] == 1}
+} -result 1
+
+test inv-unclosed-string {unclosed string} -body {
+    expr {[catch {::tomltcl::parse {a = "hi}}] == 1}
+} -result 1
+
+test inv-bad-key {bad key char} -body {
+    expr {[catch {::tomltcl::parse {a$b = 1}}] == 1}
+} -result 1
+
+test inv-double-eq {missing value} -body {
+    expr {[catch {::tomltcl::parse {a = }}] == 1}
+} -result 1
+
+test inv-aot-on-value {aot on static array} -body {
+    expr {[catch {::tomltcl::parse {
+a = [1, 2]
+[[a]]
+x = 1
+}}] == 1}
+} -result 1
+
+test inv-redef-key-via-dot {duplicate via dotted} -body {
+    expr {[catch {::tomltcl::parse {
+a = 1
+a.b = 2
+}}] == 1}
+} -result 1
+
+test inv-escape {bad escape} -body {
+    expr {[catch {::tomltcl::parse {a = "\q"}}] == 1}
+} -result 1
+
+test inv-leading-us {leading underscore number} -body {
+    expr {[catch {::tomltcl::parse {a = _1}}] == 1}
+} -result 1
+
+test key-literal {literal quoted key} -body {
+    ::tomltcl::tv_data [dict get [rootdict {'a b' = 1}] {a b}]
+} -result 1
+
+test mixed-table-then-aot {table then aot conflict} -body {
+    expr {[catch {::tomltcl::parse {
+[a]
+b = 1
+[[a]]
+c = 2
+}}] == 1}
+} -result 1
+
+test empty-array-key {empty array value} -body {
+    ::tomltcl::tv_type [dict get [rootdict {a = []}] a]
+} -result array
+
+test deep-dotted {deep dotted keys} -body {
+    set d [rootdict {a.b.c.d.e = 5}]
+    ::tomltcl::tv_data [::tomltcl::get [::tomltcl::tv table $d] a.b.c.d.e]
+} -result 5
+
+test hex-lower {hex lower} -body {
+    ::tomltcl::tv_data [dict get [rootdict {a = 0xff}] a]
+} -result 255
+
+test float-us {float underscores} -body {
+    ::tomltcl::tv_data [dict get [rootdict {a = 1_000.5_0}] a]
+} -result 1000.5
+
+test offset-plus {positive offset} -body {
+    ::tomltcl::tv_data [dict get [rootdict {d = 2020-01-01T00:00:00+05:30}] d]
+} -result 2020-01-01T00:00:00+05:30
+
+test comment-only-line-in-array {comment in array} -body {
+    llength [::tomltcl::tv_data [dict get [rootdict {
+a = [
+1,
+# c
+2
+]}] a]]
+} -result 2
+
+
 puts ""
 set ::_failed $::tcltest::numTests(Failed)
 cleanupTests

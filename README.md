@@ -11,6 +11,8 @@ Pure **Tcl 8.6** toolkit for [TOML 1.0.0](https://toml.io/en/v1.0.0). No Critcl,
 - Strict duplicate-key / table-conflict detection with line:column errors
 - Typed document model for faithful round-trips
 - `tomltcl::encode` / `tomltcl::stringify` with sorted keys and multiline-string heuristics
+- Path helpers `tomltcl::get` / `tomltcl::exists` (dotted paths; list paths for array indices)
+- `tomltcl::to_json` for interoperability (datetimes as strings; nan/inf as null)
 
 ## Document model
 

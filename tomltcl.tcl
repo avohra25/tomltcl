@@ -1180,12 +1180,121 @@ proc ::tomltcl::stringify {doc args} {
     encode $doc {*}$args
 }
 
+
+proc ::tomltcl::_split_path {path} {
+    # path is dotted string or list of segments
+    if {[llength $path] > 1 || [string first . $path] < 0} {
+        # could be single segment list or bare key with no dots
+        if {[llength $path] >= 1 && [string first . [lindex $path 0]] < 0 && [llength $path] > 1} {
+            return $path
+        }
+    }
+    if {[string is list -strict $path] && [llength $path] > 1} {
+        return $path
+    }
+    # Split on dots but respect that we only support simple dotted paths (bare segments)
+    set parts [split $path .]
+    if {[llength $parts] == 0} { return -code error "empty path" }
+    return $parts
+}
+
+proc ::tomltcl::_lookup {doc parts} {
+    set cur $doc
+    foreach seg $parts {
+        set t [tv_type $cur]
+        if {$t eq "table"} {
+            set d [tv_data $cur]
+            if {![dict exists $d $seg]} { return {} }
+            set cur [dict get $d $seg]
+        } elseif {$t eq "array"} {
+            # numeric index
+            if {![string is integer -strict $seg]} { return {} }
+            set arr [tv_data $cur]
+            if {$seg < 0 || $seg >= [llength $arr]} { return {} }
+            set cur [lindex $arr $seg]
+        } else {
+            return {}
+        }
+    }
+    return [list $cur]
+}
+
 proc ::tomltcl::get {doc path} {
-    return -code error "tomltcl::get not implemented yet; see stage 3"
+    set parts [::tomltcl::_split_path $path]
+    set found [::tomltcl::_lookup $doc $parts]
+    if {[llength $found] == 0} {
+        return -code error "path not found: $path"
+    }
+    return [lindex $found 0]
 }
+
 proc ::tomltcl::exists {doc path} {
-    return -code error "tomltcl::exists not implemented yet; see stage 3"
+    set parts [::tomltcl::_split_path $path]
+    expr {[llength [::tomltcl::_lookup $doc $parts]] > 0}
 }
+
+proc ::tomltcl::_json_escape {s} {
+    set out ""
+    foreach ch [split $s {}] {
+        set o [scan $ch %c]
+        switch -exact -- $ch {
+            \" { append out "\\\"" }
+            \\ { append out "\\\\" }
+            \b { append out "\\b" }
+            \f { append out "\\f" }
+            \n { append out "\\n" }
+            \r { append out "\\r" }
+            \t { append out "\\t" }
+            default {
+                if {$o < 0x20} {
+                    append out [format "\\u%04x" $o]
+                } else {
+                    append out $ch
+                }
+            }
+        }
+    }
+    return $out
+}
+
+proc ::tomltcl::_to_json_value {v} {
+    set t [tv_type $v]
+    set d [tv_data $v]
+    switch -exact -- $t {
+        string { return "\"[::tomltcl::_json_escape $d]\"" }
+        integer { return $d }
+        float {
+            if {$d eq "nan"} { return "null" }
+            if {$d eq "inf"} { return "null" }
+            if {$d eq "-inf"} { return "null" }
+            set s [::tomltcl::_encode_float $d]
+            return $s
+        }
+        bool { return [expr {$d ? "true" : "false"}] }
+        datetime - datetime-local - date - time {
+            return "\"[::tomltcl::_json_escape $d]\""
+        }
+        array {
+            set parts {}
+            foreach item $d { lappend parts [::tomltcl::_to_json_value $item] }
+            return "\[[join $parts ,]\]"
+        }
+        table {
+            set parts {}
+            foreach k [lsort [dict keys $d]] {
+                set vv [dict get $d $k]
+                lappend parts "\"[::tomltcl::_json_escape $k]\":[::tomltcl::_to_json_value $vv]"
+            }
+            return "\{[join $parts ,]\}"
+        }
+        default { return -code error "cannot convert type $t to JSON" }
+    }
+}
+
 proc ::tomltcl::to_json {doc} {
-    return -code error "tomltcl::to_json not implemented yet; see stage 3"
+    if {[tv_type $doc] ne "table"} {
+        return -code error "to_json expects a root table"
+    }
+    ::tomltcl::_to_json_value $doc
 }
+
