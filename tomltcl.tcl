@@ -2,12 +2,13 @@
 # Copyright (c) 2026 Aryan Vohra
 # SPDX-License-Identifier: MIT
 
-package provide tomltcl 0.1.0
+package provide tomltcl 0.2.0
 
 namespace eval ::tomltcl {
     namespace export parse decode encode stringify get exists to_json valid dump \
-        to_tagged_json from_tagged_json json_decode decode_bytes read_file utf8_error
-    variable version 0.1.0
+        to_tagged_json from_tagged_json json_decode decode_bytes read_file utf8_error \
+        parse_path query value_text
+    variable version 0.2.0
     variable _src ""
     variable _pos 0
     variable _len 0
@@ -1721,4 +1722,110 @@ proc ::tomltcl::read_file {path} {
     set f [open $path rb]
     try { set bytes [read $f] } finally { close $f }
     ::tomltcl::decode_bytes $bytes
+}
+
+# ---------------------------------------------------------------------------
+# Query paths
+# ---------------------------------------------------------------------------
+# A query path is a TOML key (bare, "basic" or 'literal' parts joined by
+# dots) where any part may be followed by array indices: servers.alpha.ip,
+# "a.b".c, products[1].name, matrix[0][-1]. Negative indices count from the
+# end. parse_path returns a list of {key NAME} and {index N} pairs.
+
+proc ::tomltcl::parse_path {path} {
+    set out {}
+    set i 0
+    set n [string length $path]
+    if {$n == 0} { return -code error "empty path" }
+    while 1 {
+        set c [string index $path $i]
+        if {$c eq "\""} {
+            if {![regexp -start $i -indices {\A"(?:[^"\\]|\\.)*"} $path m]} {
+                return -code error "unterminated quoted key in path: $path"
+            }
+            set q [string range $path {*}$m]
+            if {[catch {tv_data [dict get [tv_data [::tomltcl::parse "k = $q"]] k]} part]} {
+                return -code error "bad quoted key $q in path"
+            }
+            lappend out [list key $part]
+            set i [expr {[lindex $m 1] + 1}]
+        } elseif {$c eq "'"} {
+            set e [string first ' $path [expr {$i + 1}]]
+            if {$e < 0} { return -code error "unterminated quoted key in path: $path" }
+            lappend out [list key [string range $path [expr {$i + 1}] [expr {$e - 1}]]]
+            set i [expr {$e + 1}]
+        } elseif {[regexp -start $i -indices {\A[A-Za-z0-9_-]+} $path m]} {
+            lappend out [list key [string range $path {*}$m]]
+            set i [expr {[lindex $m 1] + 1}]
+        } else {
+            return -code error "bad path [list $path]: expected a key at offset $i"
+        }
+        while {[regexp -start $i -indices {\A\[(-?[0-9]+)\]} $path m g]} {
+            lappend out [list index [string range $path {*}$g]]
+            set i [expr {[lindex $m 1] + 1}]
+        }
+        if {$i >= $n} break
+        if {[string index $path $i] ne "."} {
+            return -code error "bad path [list $path]: expected '.' at offset $i"
+        }
+        incr i
+    }
+    return $out
+}
+
+proc ::tomltcl::_a {type} {
+    if {[string match {[aeiou]*} $type]} { return "an $type" }
+    return "a $type"
+}
+
+proc ::tomltcl::_where {seen} {
+    if {[llength $seen] == 0} { return "the document" }
+    join $seen .
+}
+
+# query returns the typed value at a path written as above; it errors with
+# the longest prefix that did exist when the path is missing.
+proc ::tomltcl::query {doc path} {
+    set cur $doc
+    set seen {}
+    foreach part [::tomltcl::parse_path $path] {
+        lassign $part kind seg
+        set t [tv_type $cur]
+        if {$kind eq "index"} {
+            set idx $seg
+            if {$t ne "array"} {
+                return -code error "path not found: [::tomltcl::_where $seen] is [::tomltcl::_a $t], not an array"
+            }
+            set arr [tv_data $cur]
+            if {$idx < 0} { set idx [expr {[llength $arr] + $idx}] }
+            if {$idx < 0 || $idx >= [llength $arr]} {
+                return -code error "path not found: index $seg out of range for [::tomltcl::_where $seen] ([llength $arr] element[expr {[llength $arr] == 1 ? "" : "s"}])"
+            }
+            set cur [lindex $arr $idx]
+            set seen [lreplace $seen end end "[lindex $seen end]\[$seg\]"]
+            continue
+        }
+        if {$t ne "table"} {
+            return -code error "path not found: [::tomltcl::_where $seen] is [::tomltcl::_a $t], not a table"
+        }
+        set d [tv_data $cur]
+        if {![dict exists $d $seg]} {
+            set where [expr {[llength $seen] ? "in [join $seen .]" : "at top level"}]
+            return -code error "path not found: no key [list $seg] $where"
+        }
+        set cur [dict get $d $seg]
+        lappend seen [::tomltcl::_encode_key $seg]
+    }
+    return $cur
+}
+
+# Text of a value as a shell would want it: strings and datetimes without
+# quotes, other scalars as TOML, arrays inline, tables as a TOML document.
+proc ::tomltcl::value_text {v} {
+    switch -exact -- [tv_type $v] {
+        string - datetime - datetime-local - date - time { return [tv_data $v] }
+        table { return [string trimright [::tomltcl::encode $v] \n] }
+        float { return [::tomltcl::_encode_float [tv_data $v]] }
+        default { return [::tomltcl::_encode_value $v 1] }
+    }
 }

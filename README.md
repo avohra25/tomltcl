@@ -2,7 +2,7 @@
 
 Pure **Tcl 8.6** toolkit for [TOML 1.0.0](https://toml.io/en/v1.0.0). No Critcl, tdom, or tcllib required at runtime (`tcltest` is used only for tests).
 
-## Features (0.1.0 + encode)
+## Features (0.2.0)
 
 - Lexer + recursive-descent parser for TOML 1.0.0 values and documents
 - Keys (bare, quoted, dotted), basic/literal/multiline strings, integers (hex/oct/bin + underscores), floats (`inf`/`nan`), booleans
@@ -19,6 +19,10 @@ Pure **Tcl 8.6** toolkit for [TOML 1.0.0](https://toml.io/en/v1.0.0). No Critcl,
   and truncated sequences are rejected with the byte offset; characters past
   U+FFFF round-trip correctly on Tcl 8.6
 - A small RFC 8259 JSON reader (`json_decode`)
+- Query paths (`tomltcl::query doc {products[0].name}`) with quoted parts and
+  negative indices, and a CLI for checking, querying and converting files
+- Passes all 717 TOML 1.0.0 cases of the official toml-test suite (see
+  [Conformance](#conformance))
 
 ## Document model
 
@@ -67,17 +71,40 @@ tclsh
 % puts [tomltcl::dump $doc]
 ```
 
-CLI:
+Query a document by path:
 
-```bash
-tclsh tomltcl-cli.tcl parse examples/example.toml
-tclsh tomltcl-cli.tcl valid examples/example.toml
-tclsh tomltcl-cli.tcl decode examples/example.toml      # TOML -> tagged JSON
-tclsh tomltcl-cli.tcl decode examples/example.toml | tclsh tomltcl-cli.tcl encode
+```tcl
+% set doc [tomltcl::read_file examples/example.toml]
+% tomltcl::value_text [tomltcl::query $doc {database.ports[-1]}]
+8003
 ```
 
-`decode` and `encode` read stdin when no file is given and exit 1 on bad input,
-matching the decoder/encoder interface `toml-test` expects.
+A path is a TOML key whose parts may be followed by `[N]` indices (negative
+counts from the end): `servers."alpha.eu".ip`, `products[0].name`,
+`matrix[1][-1]`. A missing path is an error that says how far it got, e.g.
+`path not found: no key nope in owner`.
+
+## Command line
+
+```bash
+tclsh tomltcl-cli.tcl check config/*.toml        # file:line:col: message, exit 1 if any invalid
+tclsh tomltcl-cli.tcl get examples/example.toml owner.name
+tclsh tomltcl-cli.tcl get --json examples/example.toml database
+tclsh tomltcl-cli.tcl json examples/example.toml  # plain JSON
+tclsh tomltcl-cli.tcl decode examples/example.toml      # TOML -> tagged JSON
+tclsh tomltcl-cli.tcl decode examples/example.toml | tclsh tomltcl-cli.tcl encode
+tclsh tomltcl-cli.tcl fmt examples/example.toml   # sorted, re-encoded
+tclsh tomltcl-cli.tcl fmt --check *.toml          # lists files that would change
+```
+
+`get` prints strings and datetimes without quotes, so it works in shell scripts
+(`port=$(tclsh tomltcl-cli.tcl get app.toml server.port)`); `--json` and
+`--tagged` print the value as JSON instead. `decode` and `encode` read stdin
+when no file is given and exit 1 on bad input, matching the decoder/encoder
+interface `toml-test` expects. `fmt` rebuilds the file from the parsed document,
+so comments are not kept; use it to check generated files rather than to rewrite
+hand-written ones. Exit status is 0 on success, 1 for invalid input or a missing
+path and 2 for usage errors (`tclsh tomltcl-cli.tcl -h` lists everything).
 
 ## Conformance
 

@@ -4,7 +4,7 @@ namespace import ::tcltest::*
 
 set root [file dirname [file dirname [file normalize [info script]]]]
 set auto_path [linsert $auto_path 0 $root]
-if {[catch {package require tomltcl 0.1.0}]} {
+if {[catch {package require tomltcl 0.2.0}]} {
     source [file join $root tomltcl.tcl]
 }
 
@@ -354,8 +354,8 @@ test decode-alias {decode alias} -body {
 } -result table
 
 test package-version {package version} -body {
-    set ::tomltcl::version
-} -result 0.1.0
+    list $::tomltcl::version [package provide tomltcl]
+} -result {0.2.0 0.2.0}
 
 test dump-runs {dump does not error} -body {
     string match *string* [::tomltcl::dump [::tomltcl::parse {a = "x"}]]
@@ -840,7 +840,7 @@ test cli-decode {decode prints tagged JSON} -body {
 
 test cli-decode-invalid {decode exits 1 on invalid TOML} -body {
     lassign [cli -input "a = \n" decode] code out
-    list $code [string match {TOML parse error at 1:*} $out]
+    list $code [string match {<stdin>:1:5: *} $out]
 } -result {1 1}
 
 test cli-encode {encode turns tagged JSON into TOML} -body {
@@ -922,6 +922,101 @@ test encode-escapes-controls {encode escapes DEL and CR so the output parses bac
     list [string match {*\\u007f*} $text] [string match {*\\r*} $text] \
          [expr {[::tomltcl::to_tagged_json [::tomltcl::parse $text]] eq [::tomltcl::to_tagged_json $doc]}]
 } -result {1 1 1}
+
+# --- query paths ---
+test path-parse {parse_path handles bare, quoted and indexed parts} -body {
+    ::tomltcl::parse_path {servers."a.b"[1][-1].'x y'.z-1}
+} -result {{key servers} {key a.b} {index 1} {index -1} {key {x y}} {key z-1}}
+
+test path-parse-escapes {basic quoted parts use TOML escapes} -body {
+    ::tomltcl::parse_path {"tab\there"."index 1"}
+} -result [list [list key "tab\there"] {key {index 1}}]
+
+test path-parse-errors {malformed paths are rejected} -body {
+    lmap p {{} a. .a {a[x]} {"open} {a b} {a..b}} { catch {::tomltcl::parse_path $p} }
+} -result {1 1 1 1 1 1 1}
+
+set ::qdoc [::tomltcl::parse {
+title = "demo"
+[[products]]
+name = "Hammer"
+sku = 738594937
+[[products]]
+name = "Nail"
+dims = [[1, 2], [3, 4]]
+[servers."alpha.eu"]
+ip = "10.0.0.1"
+up = 2024-05-01T10:00:00Z
+}]
+
+test query-values {query walks tables and arrays} -body {
+    lmap p {title products[0].sku products[-1].dims[1][0] {servers."alpha.eu".ip}} {
+        ::tomltcl::value_text [::tomltcl::query $::qdoc $p]
+    }
+} -result {demo 738594937 3 10.0.0.1}
+
+test query-errors {missing paths say how far they got} -body {
+    lmap p {nope products[2] products.name {servers."alpha.eu".ip.x} title[0]} {
+        catch {::tomltcl::query $::qdoc $p} err
+        set err
+    }
+} -result {{path not found: no key nope at top level} {path not found: index 2 out of range for products (2 elements)} {path not found: products is an array, not a table} {path not found: servers."alpha.eu".ip is a string, not a table} {path not found: title is a string, not an array}}
+
+test value-text {value_text prints scalars plainly and containers as TOML} -body {
+    list [::tomltcl::value_text [::tomltcl::query $::qdoc servers]] \
+         [::tomltcl::value_text [::tomltcl::query $::qdoc {products[1].dims}]] \
+         [::tomltcl::value_text [::tomltcl::query $::qdoc {servers."alpha.eu".up}]] \
+         [::tomltcl::value_text [::tomltcl::tv float 2.0]]
+} -result [list "\[\"alpha.eu\"\]\nip = \"10.0.0.1\"\nup = 2024-05-01T10:00:00Z" "\[\n  \[1, 2\],\n  \[3, 4\],\n\]" 2024-05-01T10:00:00Z 2.0]
+
+# --- CLI: check, get, json, fmt ---
+set ::tmpdir [makeDirectory tomltcl-cli]
+proc tmpfile {name text} {
+    set p [file join $::tmpdir $name]
+    set f [open $p wb]; puts -nonewline $f [encoding convertto utf-8 $text]; close $f
+    return $p
+}
+set ::good [tmpfile good.toml "a = 1\n\[t\]\nname = \"x\"\nlist = \[1, 2\]\n"]
+set ::bad [tmpfile bad.toml "a = 1\nb = \[1,\n"]
+
+test cli-check {check reports file:line:col for each invalid file} -body {
+    lassign [cli check $::good $::bad] code out
+    list $code [string map [list $::tmpdir/ {}] $out]
+} -result [list 1 "bad.toml:3:1: unterminated array\n1 of 2 files invalid\n"]
+
+test cli-check-ok {check is quiet and exits 0 when everything is valid} -body {
+    cli check $::good
+} -result {0 {}}
+
+test cli-get {get prints values in text, JSON or tagged form} -body {
+    list [cli get $::good t.name] [cli get --json $::good t] [cli get --tagged $::good a] \
+         [cli get $::good {t.list[-1]}]
+} -result [list [list 0 "x\n"] [list 0 "{\"list\":\[1,2\],\"name\":\"x\"}\n"] \
+             [list 0 "{\"type\": \"integer\", \"value\": \"1\"}\n"] [list 0 "2\n"]]
+
+test cli-get-missing {get exits 1 when the path is missing} -body {
+    cli get $::good t.nope
+} -result [list 1 "path not found: no key nope in t\n"]
+
+test cli-json {json prints plain JSON} -body {
+    cli -input "x = 1979-05-27\ny = \[true\]" json
+} -result [list 0 "{\"x\":\"1979-05-27\",\"y\":\[true\]}\n"]
+
+test cli-fmt {fmt re-encodes and --check lists unformatted files} -body {
+    set formatted [tmpfile fmt.toml [lindex [cli fmt $::good] 1]]
+    set messy [tmpfile messy.toml "z=1\n  a   =   2\n"]
+    lassign [cli fmt --check $formatted $messy] code out
+    list $code [string map [list $::tmpdir/ {}] $out] [cli -input "z=1\na=2" fmt]
+} -result [list 1 "messy.toml\n" [list 0 "a = 2\nz = 1\n"]]
+
+test cli-usage {unknown commands print usage and exit 2} -body {
+    lassign [cli frobnicate] code out
+    list $code [string match {Usage: *} $out]
+} -result {2 1}
+
+test cli-version {version prints the package version} -body {
+    cli version
+} -result [list 0 "0.2.0\n"]
 
 # --- toml-test suite (decoder, encoder round trip, invalid documents) ---
 source [file join $root tests compliance.tcl]
