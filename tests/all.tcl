@@ -241,15 +241,21 @@ c = 2
 }}] == 1}
 } -result 1
 
-test table-implicit-ok {implicit then explicit ok} -body {
+test table-implicit-ok {header parents are implicit and may be defined later} -body {
     set d [rootdict {
-a.b = 1
+[a.b]
+x = 1
 [a]
 c = 2
 }]
-    list [::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get $d a]] b]] \
+    list [::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get $d a]] b]] x]] \
          [::tomltcl::tv_data [dict get [::tomltcl::tv_data [dict get $d a]] c]]
 } -result {1 2}
+
+test table-dotted-then-header {a table made by dotted keys cannot get a header} -body {
+    catch {::tomltcl::parse "a.b = 1\n\[a\]\nc = 2"} err
+    set err
+} -result {TOML parse error at 2:1: table 'a' was already created with dotted keys}
 
 # --- array of tables ---
 test aot-1 {array of tables} -body {
@@ -845,6 +851,84 @@ test cli-encode-invalid {encode rejects untagged JSON} -body {
     lassign [cli -input {{"a": 1}} encode] code out
     list $code [string trim $out]
 } -result {1 {a: bare JSON number is not a tagged value}}
+
+# --- conformance fixes found by toml-test ---
+proc perr {text} {
+    if {[catch {::tomltcl::parse $text} err]} { return $err }
+    return ok
+}
+
+test ctrl-comment {control characters are rejected in comments} -body {
+    list [perr "a = 1 # x\x01y"] [perr "# del \x7f"] [perr "# tab\tok"]
+} -result {{TOML parse error at 1:10: control character U+0001 in comment} {TOML parse error at 1:7: control character U+007F in comment} ok}
+
+test ctrl-strings {DEL and C0 controls are rejected in every string form} -body {
+    lmap src [list "a = \"x\x7f\"" "a = 'x\x1f'" "a = \"\"\"x\x00\"\"\"" "a = '''x\x10'''"] {
+        regexp {control character} [perr $src]
+    }
+} -result {1 1 1 1}
+
+test bare-cr {a carriage return must be followed by a newline} -body {
+    list [perr "a = 1\r"] [perr "# c\rb = 1"] [perr "a = '''x\ry'''"] [perr "a = 1\r\nb = 2\r\n"]
+} -result {{TOML parse error at 1:6: carriage return not followed by newline} {TOML parse error at 1:4: carriage return not followed by newline in comment} {TOML parse error at 1:9: carriage return not followed by newline} ok}
+
+test crlf-multiline {CRLF inside multiline strings reads as a newline} -body {
+    ::tomltcl::tv_data [dict get [rootdict "a = \"\"\"\r\nx\r\ny\"\"\""] a]
+} -result "x\ny"
+
+test line-ending-backslash {a line-ending backslash also swallows blank lines} -body {
+    ::tomltcl::tv_data [dict get [rootdict "a = \"\"\"\nfox \\  \n\n\n   jumps\"\"\""] a]
+} -result "fox jumps"
+
+test leap-years {February 29 only exists in leap years} -body {
+    lmap d {2024-02-29 2023-02-29 2000-02-29 1900-02-29 2023-04-31 2023-12-31} {
+        expr {[perr "d = $d"] eq "ok"}
+    }
+} -result {1 0 1 0 0 1}
+
+test radix-prefix-case {0X, 0O and 0B are not valid prefixes} -body {
+    list [perr "a = 0XFF"] [perr "a = 0O7"] [perr "a = 0B1"] [perr "a = 0xFF"]
+} -result {{TOML parse error at 1:6: expected newline or end of file, got 'X'} {TOML parse error at 1:6: expected newline or end of file, got 'O'} {TOML parse error at 1:6: expected newline or end of file, got 'B'} ok}
+
+test date-then-comment {a date followed by a space and a comment is just a date} -body {
+    ::tomltcl::dump [::tomltcl::parse "d = 1979-05-27 # birthday\nt = 1979-05-27 07:32:00"]
+} -result {table{
+  d = date(1979-05-27)
+  t = datetime-local(1979-05-27T07:32:00)
+}}
+
+test inline-closed {inline tables cannot be extended afterwards} -body {
+    list [perr "a = {}\n\[a.b\]"] [perr "a = {x = 1}\na.y = 2"] \
+         [perr "t = { inner = { dog = 1 }, inner.cat = 2 }"] \
+         [perr "t = { a.b = 1, a.c = 2 }"]
+} -result {{TOML parse error at 2:1: inline table 'a' cannot be extended} {TOML parse error at 2:1: inline table 'a' cannot be extended} {TOML parse error at 1:28: cannot extend 'inner' in inline table} ok}
+
+test dotted-rules {dotted keys may not reach into tables defined elsewhere} -body {
+    list [perr "\[a.b.c\]\nz = 9\n\[a\]\nb.c.t = 1"] \
+         [perr "\[\[a.b\]\]\n\[a\]\nb.y = 2"] \
+         [perr "\[fruit\]\napple.taste.sweet = true\n\[fruit.apple.taste\]"] \
+         [perr "\[fruit\]\napple.color = 1\n\[fruit.apple.texture\]\nsmooth = true"] \
+         [perr "\[c.a.a\]\n\[c\]\na.x = 1"] \
+         [perr "\[c.a.a\]\n\[c\]\na.x = 1\n\[c.a\]"]
+} -result {{TOML parse error at 4:1: cannot add keys to table 'a.b.c' with dotted keys outside the section that defines it} {TOML parse error at 3:1: cannot add keys to array of tables 'a.b' with dotted keys} {TOML parse error at 3:1: table 'fruit.apple.taste' was already created with dotted keys} ok ok {TOML parse error at 4:1: table 'c.a' was already created with dotted keys}}
+
+test aot-on-static-array {[[x]] cannot append to a static array} -body {
+    perr "x = \[1\]\n\[\[x\]\]"
+} -result {TOML parse error at 2:1: cannot append to static array 'x' with [[x]]}
+
+test encode-escapes-controls {encode escapes DEL and CR so the output parses back the same} -body {
+    set doc [::tomltcl::from_tagged_json {{"a": {"type": "string", "value": "x\u007fy"}, "b": {"type": "string", "value": "Roses are red\r\nViolets are blue, sugar is sweet"}}}]
+    set text [::tomltcl::encode $doc]
+    list [string match {*\\u007f*} $text] [string match {*\\r*} $text] \
+         [expr {[::tomltcl::to_tagged_json [::tomltcl::parse $text]] eq [::tomltcl::to_tagged_json $doc]}]
+} -result {1 1 1}
+
+# --- toml-test suite (decoder, encoder round trip, invalid documents) ---
+source [file join $root tests compliance.tcl]
+test toml-test-suite {all vendored toml-test 1.0.0 cases match known-failures} -body {
+    ::compliance::run {}
+} -result 1 -output {toml-test 1.0.0: 717 files, 717 passed, 0 failed (0 known)
+}
 
 puts ""
 set ::_failed $::tcltest::numTests(Failed)

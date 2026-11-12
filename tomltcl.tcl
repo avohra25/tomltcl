@@ -14,6 +14,8 @@ namespace eval ::tomltcl {
     variable _line 1
     variable _col 1
     variable defined
+    variable section 0
+    variable _keypos {1 1}
 }
 
 proc ::tomltcl::_err {msg} {
@@ -83,17 +85,34 @@ proc ::tomltcl::_skip_ws_comments {} {
             continue
         }
         if {$c eq "#"} {
-            while {![::tomltcl::_eof]} {
-                set c [::tomltcl::_advance]
-                if {$c eq "\n"} break
-                if {$c eq "\r"} {
-                    if {[::tomltcl::_peek] eq "\n"} { ::tomltcl::_advance }
-                    break
-                }
-            }
+            ::tomltcl::_skip_comment
             continue
         }
         break
+    }
+}
+
+# A comment runs to the end of the line; the newline itself is left for the
+# caller. Control characters other than tab are not allowed inside it.
+proc ::tomltcl::_skip_comment {} {
+    ::tomltcl::_advance
+    while {![::tomltcl::_eof]} {
+        set c [::tomltcl::_peek]
+        if {$c eq "\n"} break
+        if {$c eq "\r" && [::tomltcl::_peek 1] eq "\n"} break
+        ::tomltcl::_check_char $c comment
+        ::tomltcl::_advance
+    }
+}
+
+# Control characters (U+0000-U+001F except tab, and U+007F) may not appear
+# literally in comments or strings.
+proc ::tomltcl::_check_char {c where} {
+    if {$c eq "\t"} return
+    scan $c %c o
+    if {$o < 0x20 || $o == 0x7F} {
+        if {$c eq "\r"} { ::tomltcl::_err "carriage return not followed by newline in $where" }
+        ::tomltcl::_err [format "control character U+%04X in %s" $o $where]
     }
 }
 
@@ -105,11 +124,7 @@ proc ::tomltcl::_skip_ws_inline {} {
             continue
         }
         if {$c eq "#"} {
-            while {![::tomltcl::_eof]} {
-                set c [::tomltcl::_peek]
-                if {$c eq "\n" || $c eq "\r" || $c eq ""} break
-                ::tomltcl::_advance
-            }
+            ::tomltcl::_skip_comment
             break
         }
         break
@@ -120,12 +135,7 @@ proc ::tomltcl::_expect_nl_or_eof {} {
     ::tomltcl::_skip_ws_inline
     set c [::tomltcl::_peek]
     if {$c eq ""} return
-    if {$c eq "\n"} { ::tomltcl::_advance; return }
-    if {$c eq "\r"} {
-        ::tomltcl::_advance
-        if {[::tomltcl::_peek] eq "\n"} { ::tomltcl::_advance }
-        return
-    }
+    if {[::tomltcl::_skip_nl]} return
     set shown $c
     if {$c eq "\n"} { set shown "\\n" }
     if {$c eq "\r"} { set shown "\\r" }
@@ -137,8 +147,11 @@ proc ::tomltcl::_skip_nl {} {
     set c [::tomltcl::_peek]
     if {$c eq "\n"} { ::tomltcl::_advance; return 1 }
     if {$c eq "\r"} {
+        if {[::tomltcl::_peek 1] ne "\n"} {
+            ::tomltcl::_err "carriage return not followed by newline"
+        }
         ::tomltcl::_advance
-        if {[::tomltcl::_peek] eq "\n"} { ::tomltcl::_advance }
+        ::tomltcl::_advance
         return 1
     }
     return 0
@@ -302,12 +315,20 @@ proc ::tomltcl::_parse_basic_string {multiline} {
                     if {![::tomltcl::_skip_nl]} {
                         ::tomltcl::_err "invalid line-ending backslash"
                     }
-                    while {[::tomltcl::_is_ws [::tomltcl::_peek]]} { ::tomltcl::_advance }
+                    while {[::tomltcl::_is_ws [::tomltcl::_peek]] || [::tomltcl::_skip_nl]} {
+                        if {[::tomltcl::_is_ws [::tomltcl::_peek]]} { ::tomltcl::_advance }
+                    }
                     continue
                 }
                 append buf [::tomltcl::_parse_escape]
                 continue
             }
+            if {$c eq "\r" || $c eq "\n"} {
+                ::tomltcl::_skip_nl
+                append buf "\n"
+                continue
+            }
+            ::tomltcl::_check_char $c "multiline string"
             append buf [::tomltcl::_advance]
         } else {
             if {$c eq "\""} {
@@ -322,10 +343,7 @@ proc ::tomltcl::_parse_basic_string {multiline} {
                 append buf [::tomltcl::_parse_escape]
                 continue
             }
-            set o [scan $c %c]
-            if {$o < 0x20 && $c ne "\t"} {
-                ::tomltcl::_err "invalid control character in string"
-            }
+            ::tomltcl::_check_char $c string
             append buf [::tomltcl::_advance]
         }
     }
@@ -360,6 +378,12 @@ proc ::tomltcl::_parse_literal_string {multiline} {
                 }
                 return $buf
             }
+            if {$c eq "\r" || $c eq "\n"} {
+                ::tomltcl::_skip_nl
+                append buf "\n"
+                continue
+            }
+            ::tomltcl::_check_char $c "multiline literal string"
             append buf [::tomltcl::_advance]
         } else {
             if {$c eq "'"} {
@@ -369,6 +393,7 @@ proc ::tomltcl::_parse_literal_string {multiline} {
             if {$c eq "\n" || $c eq "\r"} {
                 ::tomltcl::_err "newline in literal string"
             }
+            ::tomltcl::_check_char $c "literal string"
             append buf [::tomltcl::_advance]
         }
     }
@@ -466,6 +491,14 @@ proc ::tomltcl::_parse_local_time {} {
     tv time $h:$m:$s$frac
 }
 
+proc ::tomltcl::_days_in_month {y m} {
+    if {$m == 2} {
+        expr {($y % 4 == 0 && $y % 100 != 0) || $y % 400 == 0 ? 29 : 28}
+    } else {
+        lindex {0 31 28 31 30 31 30 31 31 30 31 30 31} $m
+    }
+}
+
 proc ::tomltcl::_parse_datetime {} {
     set Y [::tomltcl::_read_digits_underscores 0]
     if {[string length $Y] != 4 || ![::tomltcl::_match -]} { ::tomltcl::_err "invalid date" }
@@ -475,11 +508,16 @@ proc ::tomltcl::_parse_datetime {} {
     if {[string length $D] != 2} { ::tomltcl::_err "invalid date" }
     set Moi [scan $Mo %d]
     set Di [scan $D %d]
-    if {$Moi < 1 || $Moi > 12 || $Di < 1 || $Di > 31} { ::tomltcl::_err "date out of range" }
+    set Yi [scan $Y %d]
+    if {$Moi < 1 || $Moi > 12 || $Di < 1 || $Di > [::tomltcl::_days_in_month $Yi $Moi]} {
+        ::tomltcl::_err "date out of range: $Y-$Mo-$D"
+    }
     set date $Y-$Mo-$D
 
+    # A space only separates date and time when a time actually follows.
     set c [::tomltcl::_peek]
-    if {$c ne "T" && $c ne "t" && $c ne " "} {
+    if {$c ne "T" && $c ne "t"
+            && !($c eq " " && [regexp {^[0-9]$} [::tomltcl::_peek 1]])} {
         return [tv date $date]
     }
     ::tomltcl::_advance
@@ -531,21 +569,21 @@ proc ::tomltcl::_parse_number {} {
 
     if {[::tomltcl::_peek] eq "0"} {
         set n1 [::tomltcl::_peek 1]
-        if {$n1 eq "x" || $n1 eq "X"} {
+        if {$n1 eq "x"} {
             if {$sign ne ""} { ::tomltcl::_err "sign not allowed on hex" }
             ::tomltcl::_advance
             ::tomltcl::_advance
             set digits [::tomltcl::_read_hex_oct_bin 16]
             return [tv integer [expr {wide("0x$digits")}]]
         }
-        if {$n1 eq "o" || $n1 eq "O"} {
+        if {$n1 eq "o"} {
             if {$sign ne ""} { ::tomltcl::_err "sign not allowed on octal" }
             ::tomltcl::_advance
             ::tomltcl::_advance
             set digits [::tomltcl::_read_hex_oct_bin 8]
             return [tv integer [expr {wide("0$digits")}]]
         }
-        if {$n1 eq "b" || $n1 eq "B"} {
+        if {$n1 eq "b"} {
             if {$sign ne ""} { ::tomltcl::_err "sign not allowed on binary" }
             ::tomltcl::_advance
             ::tomltcl::_advance
@@ -702,14 +740,28 @@ proc ::tomltcl::_parse_inline_table {} {
     }
     while {1} {
         ::tomltcl::_skip_ws_inline
+        variable _line
+        variable _col
+        set keypos [list $_line $_col]
         set keyparts [::tomltcl::_parse_key]
         ::tomltcl::_skip_ws_inline
         if {![::tomltcl::_match =]} { ::tomltcl::_err "expected '=' in inline table" }
         ::tomltcl::_skip_ws_inline
         set val [::tomltcl::_parse_value]
+        # Tables made by dotted keys inside this inline table may gain more
+        # keys; values (including nested inline tables) are closed.
+        set prefix {}
+        foreach part [lrange $keyparts 0 end-1] {
+            lappend prefix $part
+            set pk [join $prefix \0]
+            if {[dict exists $defined $pk] && [dict get $defined $pk] ne "dotted"} {
+                ::tomltcl::_err_at {*}$keypos "cannot extend '[join $prefix .]' in inline table"
+            }
+            dict set defined $pk dotted
+        }
         set pk [join $keyparts \0]
         if {[dict exists $defined $pk]} {
-            ::tomltcl::_err "duplicate key '[join $keyparts .]'"
+            ::tomltcl::_err_at {*}$keypos "duplicate key '[join $keyparts .]'"
         }
         set table [::tomltcl::_inline_set $table {} $keyparts $val]
         dict set defined $pk value
@@ -746,131 +798,137 @@ proc ::tomltcl::_path_key {parts} {
     join $parts \0
 }
 
-proc ::tomltcl::_mutate {node path remaining mode value} {
-    variable defined
-    set nrem [llength $remaining]
-    if {$nrem == 0} {
-        return $value
-    }
-    set seg [lindex $remaining 0]
-    set rest [lrange $remaining 1 end]
-    set is_last [expr {[llength $rest] == 0}]
-    set prefix [concat $path [list $seg]]
-    set pk [::tomltcl::_path_key $prefix]
-
-    if {[tv_type $node] ne "table"} {
-        ::tomltcl::_err "cannot assign into non-table at '[join $path .]'"
-    }
-    set d [tv_data $node]
-
-    if {$is_last} {
-        if {$mode eq "value"} {
-            if {[dict exists $d $seg]} {
-                ::tomltcl::_err "duplicate key '[join $prefix .]'"
-            }
-            if {[dict exists $defined $pk] && [dict get $defined $pk] ne "implicit"} {
-                ::tomltcl::_err "duplicate key '[join $prefix .]'"
-            }
-            dict set d $seg $value
-            dict set defined $pk value
-            return [tv table $d]
-        }
-        if {$mode eq "table"} {
-            if {[dict exists $defined $pk]} {
-                set k [dict get $defined $pk]
-                if {$k eq "table"} {
-                    ::tomltcl::_err "redefining table '[join $prefix .]'"
-                }
-                if {$k eq "value" || $k eq "aot"} {
-                    ::tomltcl::_err "conflict at '[join $prefix .]'"
-                }
-                if {![dict exists $d $seg] || [tv_type [dict get $d $seg]] ne "table"} {
-                    ::tomltcl::_err "conflict at '[join $prefix .]'"
-                }
-                dict set defined $pk table
-                return [tv table $d]
-            }
-            if {[dict exists $d $seg]} {
-                ::tomltcl::_err "duplicate key '[join $prefix .]'"
-            }
-            dict set d $seg [tv table [dict create]]
-            dict set defined $pk table
-            return [tv table $d]
-        }
-        if {$mode eq "aot-append"} {
-            if {[dict exists $d $seg]} {
-                set ex [dict get $d $seg]
-                if {[tv_type $ex] ne "array"} {
-                    ::tomltcl::_err "cannot use array-of-tables on non-array '[join $prefix .]'"
-                }
-                if {[dict exists $defined $pk] && [dict get $defined $pk] ne "aot"} {
-                    ::tomltcl::_err "conflict at '[join $prefix .]'"
-                }
-                set arr [tv_data $ex]
-                lappend arr [tv table [dict create]]
-                dict set d $seg [tv array $arr]
-                dict set defined $pk aot
-                # Keys under prior AOT elements may be reused in the new element
-                set prefix_key "$pk\0"
-                foreach k [dict keys $defined] {
-                    if {[string first $prefix_key $k] == 0} {
-                        dict unset defined $k
-                    }
-                }
-                return [tv table $d]
-            }
-            dict set d $seg [tv array [list [tv table [dict create]]]]
-            dict set defined $pk aot
-            return [tv table $d]
-        }
-    }
-
-    if {[dict exists $d $seg]} {
-        set child [dict get $d $seg]
-        set ct [tv_type $child]
-        if {$ct eq "table"} {
-            if {![dict exists $defined $pk]} {
-                dict set defined $pk implicit
-            }
-            set newchild [::tomltcl::_mutate $child $prefix $rest $mode $value]
-            dict set d $seg $newchild
-            return [tv table $d]
-        }
-        if {$ct eq "array"} {
-            if {[dict exists $defined $pk] && [dict get $defined $pk] eq "value"} {
-                ::tomltcl::_err "cannot descend into array value '[join $prefix .]'"
-            }
-            set arr [tv_data $child]
-            if {[llength $arr] == 0} {
-                ::tomltcl::_err "empty array-of-tables '[join $prefix .]'"
-            }
-            set last [lindex $arr end]
-            if {[tv_type $last] ne "table"} {
-                ::tomltcl::_err "array '[join $prefix .]' is not array-of-tables"
-            }
-            set newlast [::tomltcl::_mutate $last $prefix $rest $mode $value]
-            set arr [lreplace $arr end end $newlast]
-            dict set d $seg [tv array $arr]
-            return [tv table $d]
-        }
-        ::tomltcl::_err "cannot descend into '[join $prefix .]'"
-    } else {
-        dict set defined $pk implicit
-        set child [tv table [dict create]]
-        set newchild [::tomltcl::_mutate $child $prefix $rest $mode $value]
-        dict set d $seg $newchild
-        return [tv table $d]
-    }
+# How each table or key in the document came to exist decides what may later
+# extend it (TOML 1.0.0, "Table" and "Keys"). Kinds, keyed by path:
+#   implicit     created as a parent by a [header] or [[header]] path; the
+#                first [header] or dotted key that fills it in defines it
+#   header       defined by its own [header]
+#   dotted:N     created by dotted keys in section N (only section N may add
+#                more keys to it with dotted keys; nobody may give it a header)
+#   aot          array of tables; paths below it refer to its last element
+#   inline       inline table, closed once written
+#   value        any other value
+# Paths below an array of tables are forgotten when a new element starts.
+# Definition errors point at the start of the key or header that caused them,
+# not at the end of the value that was just read.
+proc ::tomltcl::_mark_key {} {
+    variable _line
+    variable _col
+    variable _keypos [list $_line $_col]
 }
 
-proc ::tomltcl::_doc_set {docVar parts value {mode value}} {
-    upvar 1 $docVar doc
-    set doc [::tomltcl::_mutate $doc {} $parts $mode $value]
+proc ::tomltcl::_kerr {msg} {
+    variable _keypos
+    ::tomltcl::_err_at {*}$_keypos $msg
+}
+
+proc ::tomltcl::_kind {pk} {
+    variable defined
+    if {[dict exists $defined $pk]} { return [dict get $defined $pk] }
+    return ""
+}
+
+proc ::tomltcl::_put {node prefix segs nheader mode value} {
+    variable defined
+    variable section
+    set seg [lindex $segs 0]
+    set rest [lrange $segs 1 end]
+    set path [concat $prefix [list $seg]]
+    set pk [::tomltcl::_path_key $path]
+    set name [join $path .]
+    set d [tv_data $node]
+    set exists [dict exists $d $seg]
+    set kind [::tomltcl::_kind $pk]
+
+    if {[llength $rest] == 0} {
+        switch -exact -- $mode {
+            table {
+                if {!$exists} {
+                    dict set d $seg [tv table [dict create]]
+                } elseif {$kind ne "implicit"} {
+                    switch -glob -- $kind {
+                        header { ::tomltcl::_kerr "table '$name' is defined more than once" }
+                        dotted:* { ::tomltcl::_kerr "table '$name' was already created with dotted keys" }
+                        aot { ::tomltcl::_kerr "'$name' is an array of tables, not a table" }
+                        inline { ::tomltcl::_kerr "inline table '$name' cannot be extended" }
+                        default { ::tomltcl::_kerr "key '$name' is already defined" }
+                    }
+                }
+                dict set defined $pk header
+            }
+            aot {
+                if {!$exists} {
+                    dict set d $seg [tv array [list [tv table [dict create]]]]
+                } elseif {$kind eq "aot"} {
+                    set arr [tv_data [dict get $d $seg]]
+                    lappend arr [tv table [dict create]]
+                    dict set d $seg [tv array $arr]
+                    foreach k [dict keys $defined "$pk\0*"] { dict unset defined $k }
+                } elseif {$kind eq "value" && [tv_type [dict get $d $seg]] eq "array"} {
+                    ::tomltcl::_kerr "cannot append to static array '$name' with \[\[$name\]\]"
+                } else {
+                    ::tomltcl::_kerr "'$name' is already defined and is not an array of tables"
+                }
+                dict set defined $pk aot
+            }
+            value {
+                if {$exists} { ::tomltcl::_kerr "duplicate key '$name'" }
+                dict set d $seg $value
+                dict set defined $pk [expr {[tv_type $value] eq "table" ? "inline" : "value"}]
+            }
+        }
+        return [tv table $d]
+    }
+
+    if {[llength $prefix] < $nheader || $mode ne "value"} {
+        # Walking a [header] path (or the current section's own path).
+        if {!$exists} {
+            set child [tv table [dict create]]
+            dict set defined $pk implicit
+        } else {
+            switch -glob -- $kind {
+                implicit - header - dotted:* { set child [dict get $d $seg] }
+                aot {
+                    set arr [tv_data [dict get $d $seg]]
+                    set child [lindex $arr end]
+                    set new [::tomltcl::_put $child $path $rest $nheader $mode $value]
+                    dict set d $seg [tv array [lreplace $arr end end $new]]
+                    return [tv table $d]
+                }
+                inline { ::tomltcl::_kerr "inline table '$name' cannot be extended" }
+                default { ::tomltcl::_kerr "key '$name' is not a table" }
+            }
+        }
+    } else {
+        # Walking the dotted part of a key.
+        if {!$exists} {
+            set child [tv table [dict create]]
+            dict set defined $pk dotted:$section
+        } elseif {$kind eq "dotted:$section" || $kind eq "implicit"} {
+            # A parent made implicitly by a header may be filled in with
+            # dotted keys; that counts as defining it here.
+            set child [dict get $d $seg]
+            dict set defined $pk dotted:$section
+        } else {
+            switch -glob -- $kind {
+                header - dotted:* {
+                    ::tomltcl::_kerr "cannot add keys to table '$name' with dotted keys outside the section that defines it"
+                }
+                aot { ::tomltcl::_kerr "cannot add keys to array of tables '$name' with dotted keys" }
+                inline { ::tomltcl::_kerr "inline table '$name' cannot be extended" }
+                default { ::tomltcl::_kerr "key '$name' is not a table" }
+            }
+        }
+    }
+    dict set d $seg [::tomltcl::_put $child $path $rest $nheader $mode $value]
+    return [tv table $d]
 }
 
 proc ::tomltcl::_parse_document {} {
     variable defined
+    variable section
     set defined [dict create]
+    set section 0
     set doc [tv table [dict create]]
     set current_path {}
 
@@ -883,6 +941,7 @@ proc ::tomltcl::_parse_document {} {
         if {[::tomltcl::_eof]} break
 
         set c [::tomltcl::_peek]
+        ::tomltcl::_mark_key
         if {$c eq {[}} {
             if {[::tomltcl::_peek 1] eq {[}} {
                 ::tomltcl::_advance
@@ -895,8 +954,9 @@ proc ::tomltcl::_parse_document {} {
                 }
                 ::tomltcl::_advance
                 ::tomltcl::_advance
-                ::tomltcl::_doc_set doc $parts {} aot-append
+                set doc [::tomltcl::_put $doc {} $parts 0 aot {}]
                 set current_path $parts
+                incr section
                 ::tomltcl::_expect_nl_or_eof
             } else {
                 ::tomltcl::_advance
@@ -904,8 +964,9 @@ proc ::tomltcl::_parse_document {} {
                 set parts [::tomltcl::_parse_key]
                 ::tomltcl::_skip_ws_inline
                 if {![::tomltcl::_match {]}]} { ::tomltcl::_err "expected ]" }
-                ::tomltcl::_doc_set doc $parts {} table
+                set doc [::tomltcl::_put $doc {} $parts 0 table {}]
                 set current_path $parts
+                incr section
                 ::tomltcl::_expect_nl_or_eof
             }
         } elseif {[::tomltcl::_is_bare_key_char $c] || $c eq "\"" || $c eq "'"} {
@@ -917,7 +978,7 @@ proc ::tomltcl::_parse_document {} {
             if {$c2 eq "\n" || $c2 eq "\r"} { ::tomltcl::_err "newline after '='" }
             set val [::tomltcl::_parse_value]
             set full [concat $current_path $parts]
-            ::tomltcl::_doc_set doc $full $val value
+            set doc [::tomltcl::_put $doc {} $full [llength $current_path] value $val]
             ::tomltcl::_expect_nl_or_eof
         } else {
             ::tomltcl::_err "unexpected character '$c'"
@@ -1012,7 +1073,7 @@ proc ::tomltcl::_encode_basic_string {s} {
             \f { append out "\\f" }
             \r { append out "\\r" }
             default {
-                if {$o < 0x20} {
+                if {$o < 0x20 || $o == 0x7F} {
                     append out [format "\\u%04x" $o]
                 } else {
                     append out $ch
@@ -1029,12 +1090,24 @@ proc ::tomltcl::_prefer_multiline {s} {
 }
 
 proc ::tomltcl::_encode_ml_basic {s} {
-    # Use multiline basic string; escape only what we must
-    set body $s
-    # Escape sequences that would break out
-    set body [string map {"\\" "\\\\"} $body]
-    # Avoid """ in content by escaping quotes near triples - simple: escape all "
-    set body [string map {"\"" "\\\""} $body]
+    # Multiline basic string: newlines and tabs stay literal; quotes,
+    # backslashes and every other control character (including CR, which a
+    # parser may normalise away) are escaped.
+    set body ""
+    foreach ch [split $s {}] {
+        scan $ch %c o
+        if {$ch eq "\n" || $ch eq "\t"} {
+            append body $ch
+        } elseif {$ch eq "\\" || $ch eq "\""} {
+            append body "\\" $ch
+        } elseif {$ch eq "\r"} {
+            append body "\\r"
+        } elseif {$o < 0x20 || $o == 0x7F} {
+            append body [format "\\u%04x" $o]
+        } else {
+            append body $ch
+        }
+    }
     return "\"\"\"\n$body\"\"\""
 }
 

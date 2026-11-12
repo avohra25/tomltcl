@@ -79,10 +79,42 @@ tclsh tomltcl-cli.tcl decode examples/example.toml | tclsh tomltcl-cli.tcl encod
 `decode` and `encode` read stdin when no file is given and exit 1 on bad input,
 matching the decoder/encoder interface `toml-test` expects.
 
+## Conformance
+
+`tests/toml-test/` vendors the TOML 1.0.0 cases from
+[toml-test](https://github.com/toml-lang/toml-test) (MIT): 208 valid documents
+with their expected tagged JSON and 509 invalid ones. `tests/compliance.tcl`
+runs all of them three ways: decode and compare with the expected JSON, build
+each valid document from its JSON, encode it and parse it back, and make sure
+every invalid document is rejected. All 717 pass, and the run is part of
+`tests/all.tcl`; anything that ever has to be skipped goes in
+`tests/toml-test/known-failures`, and the runner fails if the list goes stale.
+
+```bash
+tclsh tests/compliance.tcl                  # summary
+tclsh tests/compliance.tcl -v 'invalid/table/*'
+```
+
+Getting there meant fixing a few gaps: control characters (and a lone carriage
+return) in comments and strings, February 29 in non-leap years, upper-case
+`0X`/`0O`/`0B` prefixes, line-ending backslashes followed by blank lines, a date
+followed by ` # comment`, and the rules for which tables may be extended from
+where. Tables are tracked by how they were made: a `[header]`, a parent implied
+by a header, dotted keys in a given section, an inline table or an array of
+tables. Dotted keys can't reach into a table that has its own header, a table
+made by dotted keys can't later get a header, inline tables are closed, and
+definition errors point at the key or header that caused them.
+
+`tests/differential.py` (needs Python 3.11+) generates thousands of random
+documents mixing headers, arrays of tables, dotted keys and inline tables and
+checks that tomltcl accepts exactly what Python's `tomllib` accepts, with the
+same result.
+
 ## Tests
 
 ```bash
 tclsh tests/all.tcl
+python3 tests/differential.py --seed 7   # optional
 ```
 
 ## License

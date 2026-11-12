@@ -1,0 +1,3 @@
+# toml-test cases tomltcl is known to fail, one id per line (e.g. valid/key/foo).
+# tests/compliance.tcl fails if anything outside this list fails, or if a
+# listed case starts passing. Currently empty: all 717 TOML 1.0.0 cases pass.
