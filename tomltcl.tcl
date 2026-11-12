@@ -5,7 +5,8 @@
 package provide tomltcl 0.1.0
 
 namespace eval ::tomltcl {
-    namespace export parse decode encode stringify get exists to_json valid dump
+    namespace export parse decode encode stringify get exists to_json valid dump \
+        to_tagged_json from_tagged_json json_decode decode_bytes read_file utf8_error
     variable version 0.1.0
     variable _src ""
     variable _pos 0
@@ -233,7 +234,19 @@ proc ::tomltcl::_parse_unicode_escape {n} {
     if {$cp > 0x10FFFF} {
         ::tomltcl::_err "unicode escape out of range"
     }
-    format %c $cp
+    ::tomltcl::_char $cp
+}
+
+# Tcl 8.6 strings hold UTF-16 code units, and [format %c] maps anything past
+# U+FFFF to U+FFFD. Build a surrogate pair instead; Tcl's utf-8 encoder
+# turns the pair back into the proper 4-byte sequence.
+proc ::tomltcl::_char {cp} {
+    if {$cp < 0x10000 || [string length [format %c 0x10000]] == 1
+            && [scan [format %c 0x10000] %c] == 0x10000} {
+        return [format %c $cp]
+    }
+    set v [expr {$cp - 0x10000}]
+    format %c%c [expr {0xD800 + ($v >> 10)}] [expr {0xDC00 + ($v & 0x3FF)}]
 }
 
 proc ::tomltcl::_parse_escape {} {
@@ -1298,3 +1311,341 @@ proc ::tomltcl::to_json {doc} {
     ::tomltcl::_to_json_value $doc
 }
 
+
+# ---------------------------------------------------------------------------
+# JSON reader (RFC 8259) used by the tagged-JSON interchange format
+# ---------------------------------------------------------------------------
+# json_decode returns a tagged tree:
+#   {object {key value ...}} {array {v ...}} {string s} {number n}
+#   {bool 1|0} {null {}}
+# Object keys keep their source order; duplicate keys are an error.
+
+proc ::tomltcl::_jerr {msg} {
+    upvar 1 s s i i
+    set before [string range $s 0 [expr {$i - 1}]]
+    set line [expr {[regexp -all {\n} $before] + 1}]
+    set nl [string last \n $before]
+    set col [expr {$i - $nl}]
+    return -code error -level 2 "JSON parse error at ${line}:${col}: $msg"
+}
+
+proc ::tomltcl::_jws {} {
+    upvar 1 s s i i
+    if {[regexp -start $i -indices {\A[ \t\r\n]+} $s m]} {
+        set i [expr {[lindex $m 1] + 1}]
+    }
+}
+
+proc ::tomltcl::_jvalue {} {
+    upvar 1 s s i i
+    ::tomltcl::_jws
+    set c [string index $s $i]
+    switch -exact -- $c {
+        "\{" {
+            incr i
+            set out {}
+            set seen [dict create]
+            ::tomltcl::_jws
+            if {[string index $s $i] eq "\}"} { incr i; return [list object {}] }
+            while 1 {
+                ::tomltcl::_jws
+                if {[string index $s $i] ne "\""} { ::tomltcl::_jerr "expected object key" }
+                set k [::tomltcl::_jstring]
+                if {[dict exists $seen $k]} { ::tomltcl::_jerr "duplicate key [list $k]" }
+                dict set seen $k 1
+                ::tomltcl::_jws
+                if {[string index $s $i] ne ":"} { ::tomltcl::_jerr "expected ':'" }
+                incr i
+                lappend out $k [::tomltcl::_jvalue]
+                ::tomltcl::_jws
+                set c [string index $s $i]
+                incr i
+                if {$c eq ","} continue
+                if {$c eq "\}"} break
+                incr i -1
+                ::tomltcl::_jerr "expected ',' or '\}'"
+            }
+            return [list object $out]
+        }
+        "\[" {
+            incr i
+            set out {}
+            ::tomltcl::_jws
+            if {[string index $s $i] eq "\]"} { incr i; return [list array {}] }
+            while 1 {
+                lappend out [::tomltcl::_jvalue]
+                ::tomltcl::_jws
+                set c [string index $s $i]
+                incr i
+                if {$c eq ","} continue
+                if {$c eq "\]"} break
+                incr i -1
+                ::tomltcl::_jerr "expected ',' or '\]'"
+            }
+            return [list array $out]
+        }
+        "\"" { return [list string [::tomltcl::_jstring]] }
+        t { if {[string range $s $i $i+3] eq "true"} { incr i 4; return {bool 1} } }
+        f { if {[string range $s $i $i+4] eq "false"} { incr i 5; return {bool 0} } }
+        n { if {[string range $s $i $i+3] eq "null"} { incr i 4; return {null {}} } }
+        "" { ::tomltcl::_jerr "unexpected end of input" }
+        default {
+            if {[regexp -start $i -indices {\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?} $s m]} {
+                set n [string range $s {*}$m]
+                set i [expr {[lindex $m 1] + 1}]
+                return [list number $n]
+            }
+        }
+    }
+    ::tomltcl::_jerr "unexpected character [list $c]"
+}
+
+proc ::tomltcl::_jstring {} {
+    upvar 1 s s i i
+    incr i
+    set out ""
+    while 1 {
+        if {[regexp -start $i -indices {\A[^"\\\x00-\x1f]+} $s m]} {
+            append out [string range $s {*}$m]
+            set i [expr {[lindex $m 1] + 1}]
+        }
+        set c [string index $s $i]
+        if {$c eq "\""} { incr i; return $out }
+        if {$c eq ""} { ::tomltcl::_jerr "unterminated string" }
+        if {$c ne "\\"} { ::tomltcl::_jerr "control character in string" }
+        incr i
+        set e [string index $s $i]
+        incr i
+        switch -exact -- $e {
+            \" { append out \" }
+            \\ { append out \\ }
+            / { append out / }
+            b { append out \b }
+            f { append out \f }
+            n { append out \n }
+            r { append out \r }
+            t { append out \t }
+            u {
+                set h [string range $s $i [expr {$i + 3}]]
+                if {![regexp {^[0-9A-Fa-f]{4}$} $h]} { ::tomltcl::_jerr "bad \\u escape" }
+                incr i 4
+                set cp [expr {"0x$h"}]
+                if {$cp >= 0xD800 && $cp <= 0xDBFF
+                        && [regexp -start $i {\A\\u[dD][c-fC-F][0-9A-Fa-f]{2}} $s]} {
+                    set lo [expr {"0x[string range $s [expr {$i + 2}] [expr {$i + 5}]]"}]
+                    incr i 6
+                    set cp [expr {0x10000 + (($cp - 0xD800) << 10) + ($lo - 0xDC00)}]
+                } elseif {$cp >= 0xD800 && $cp <= 0xDFFF} {
+                    ::tomltcl::_jerr "unpaired surrogate in \\u escape"
+                }
+                append out [::tomltcl::_char $cp]
+            }
+            default { incr i -1; ::tomltcl::_jerr "invalid escape \\$e" }
+        }
+    }
+}
+
+proc ::tomltcl::json_decode {text} {
+    set s $text
+    set i 0
+    set v [::tomltcl::_jvalue]
+    ::tomltcl::_jws
+    if {$i < [string length $s]} { ::tomltcl::_jerr "trailing data after JSON value" }
+    return $v
+}
+
+# ---------------------------------------------------------------------------
+# Tagged JSON (the toml-test interchange format)
+# ---------------------------------------------------------------------------
+# Every scalar becomes {"type": T, "value": "..."} with T one of string,
+# integer, float, bool, datetime, datetime-local, date-local, time-local;
+# tables become objects and arrays become arrays.
+
+namespace eval ::tomltcl {
+    variable _tag_of {string string integer integer float float bool bool
+        datetime datetime datetime-local datetime-local date date-local
+        time time-local}
+    variable _type_of {string string integer integer float float bool bool
+        datetime datetime datetime-local datetime-local date-local date
+        time-local time}
+}
+
+proc ::tomltcl::_float_text {d} {
+    if {$d in {inf -inf nan}} { return $d }
+    if {[string is double -strict $d] && [string match -nocase *nan* $d]} { return nan }
+    if {$d == Inf} { return inf }
+    if {$d == -Inf} { return -inf }
+    set s [expr {double($d)}]
+    if {[regexp {^-?[0-9]+$} $s]} { append s .0 }
+    return $s
+}
+
+proc ::tomltcl::_tagged {v indent pretty} {
+    variable _tag_of
+    set t [tv_type $v]
+    set d [tv_data $v]
+    switch -exact -- $t {
+        table - array {
+            if {[llength $d] == 0} { return [expr {$t eq "table" ? "\{\}" : "\[\]"}] }
+            set parts {}
+            if {$t eq "table"} {
+                foreach k [lsort [dict keys $d]] {
+                    lappend parts "\"[::tomltcl::_json_escape $k]\":[expr {$pretty ? { } : {}}][::tomltcl::_tagged [dict get $d $k] [expr {$indent + 1}] $pretty]"
+                }
+                set open "\{"; set close "\}"
+            } else {
+                foreach item $d { lappend parts [::tomltcl::_tagged $item [expr {$indent + 1}] $pretty] }
+                set open "\["; set close "\]"
+            }
+            if {!$pretty} { return "$open[join $parts ,]$close" }
+            set pad [string repeat "  " [expr {$indent + 1}]]
+            set end [string repeat "  " $indent]
+            return "$open\n$pad[join $parts ",\n$pad"]\n$end$close"
+        }
+        default {
+            if {![dict exists $_tag_of $t]} { return -code error "cannot tag type $t" }
+            switch -exact -- $t {
+                float { set text [::tomltcl::_float_text $d] }
+                bool { set text [expr {$d ? "true" : "false"}] }
+                default { set text $d }
+            }
+            set sp [expr {$pretty ? { } : {}}]
+            return "\{\"type\":$sp\"[dict get $_tag_of $t]\",$sp\"value\":$sp\"[::tomltcl::_json_escape $text]\"\}"
+        }
+    }
+}
+
+proc ::tomltcl::to_tagged_json {doc args} {
+    set pretty 0
+    foreach {opt val} $args {
+        switch -exact -- $opt {
+            -pretty { set pretty [expr {!!$val}] }
+            default { return -code error "unknown to_tagged_json option $opt" }
+        }
+    }
+    if {[tv_type $doc] ne "table"} {
+        return -code error "to_tagged_json expects a root table"
+    }
+    ::tomltcl::_tagged $doc 0 $pretty
+}
+
+proc ::tomltcl::_untag {j where} {
+    variable _type_of
+    lassign $j jt jd
+    switch -exact -- $jt {
+        array {
+            set out {}
+            set n 0
+            foreach item $jd {
+                lappend out [::tomltcl::_untag $item "$where\[$n\]"]
+                incr n
+            }
+            return [tv array $out]
+        }
+        object {
+            set keys [dict keys $jd]
+            if {[lsort $keys] eq {type value} && [lindex [dict get $jd type] 0] eq "string"
+                    && [lindex [dict get $jd value] 0] eq "string"} {
+                set tag [lindex [dict get $jd type] 1]
+                set text [lindex [dict get $jd value] 1]
+                if {![dict exists $_type_of $tag]} {
+                    return -code error "$where: unknown type [list $tag]"
+                }
+                return [::tomltcl::_scalar_from_text [dict get $_type_of $tag] $text $where]
+            }
+            set out [dict create]
+            dict for {k v} $jd {
+                dict set out $k [::tomltcl::_untag $v [expr {$where eq "" ? "" : "$where."}]$k]
+            }
+            return [tv table $out]
+        }
+        default {
+            return -code error "$where: bare JSON $jt is not a tagged value"
+        }
+    }
+}
+
+# Parse the text of a tagged scalar, validating it with the TOML grammar so
+# that encode never emits something parse would reject.
+proc ::tomltcl::_scalar_from_text {type text where} {
+    switch -exact -- $type {
+        string { return [tv string $text] }
+        bool {
+            if {$text eq "true"} { return [tv bool 1] }
+            if {$text eq "false"} { return [tv bool 0] }
+        }
+        integer {
+            if {[regexp {^[+-]?[0-9]+$} $text]} {
+                set n [expr {$text}]
+                if {$n >= -9223372036854775808 && $n <= 9223372036854775807} {
+                    return [tv integer [expr {wide($n)}]]
+                }
+                return -code error "$where: integer out of 64-bit range: $text"
+            }
+        }
+        float {
+            switch -exact -- [string tolower $text] {
+                inf - +inf - infinity - +infinity { return [tv float inf] }
+                -inf - -infinity { return [tv float -inf] }
+                nan - +nan - -nan { return [tv float nan] }
+            }
+            if {[string is double -strict $text] && ![regexp -nocase {inf|nan|^0x} $text]} {
+                return [tv float [expr {double($text)}]]
+            }
+        }
+        datetime - datetime-local - date - time {
+            if {![catch {::tomltcl::parse "v = $text"} doc]} {
+                set v [dict get [tv_data $doc] v]
+                if {[tv_type $v] eq $type} { return $v }
+            }
+        }
+    }
+    return -code error "$where: invalid $type value [list $text]"
+}
+
+proc ::tomltcl::from_tagged_json {text} {
+    set j [::tomltcl::json_decode $text]
+    if {[lindex $j 0] ne "object"} {
+        return -code error "tagged JSON document must be an object"
+    }
+    set v [::tomltcl::_untag $j ""]
+    if {[tv_type $v] ne "table"} {
+        return -code error "tagged JSON document must be a table, not a single value"
+    }
+    return $v
+}
+
+# ---------------------------------------------------------------------------
+# Byte-level input: strict UTF-8
+# ---------------------------------------------------------------------------
+# TOML documents must be valid UTF-8. Tcl's utf-8 decoder is lenient, so
+# decode_bytes checks the raw bytes first (no overlongs, surrogates, or
+# code points past U+10FFFF) and reports the byte offset of the first bad
+# sequence. A leading byte order mark is skipped.
+
+proc ::tomltcl::utf8_error {bytes} {
+    set re {\A(?:[\x00-\x7F]|[\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})*}
+    regexp -indices $re $bytes m
+    set ok [expr {[lindex $m 1] + 1}]
+    if {$ok >= [string length $bytes]} { return -1 }
+    return $ok
+}
+
+proc ::tomltcl::decode_bytes {bytes} {
+    set bad [::tomltcl::utf8_error $bytes]
+    if {$bad >= 0} {
+        set before [string range $bytes 0 [expr {$bad - 1}]]
+        set line [expr {[regexp -all {\n} $before] + 1}]
+        return -code error "TOML parse error at line $line: invalid UTF-8 at byte offset $bad"
+    }
+    if {[string range $bytes 0 2] eq "\xEF\xBB\xBF"} {
+        set bytes [string range $bytes 3 end]
+    }
+    ::tomltcl::parse [encoding convertfrom utf-8 $bytes]
+}
+
+proc ::tomltcl::read_file {path} {
+    set f [open $path rb]
+    try { set bytes [read $f] } finally { close $f }
+    ::tomltcl::decode_bytes $bytes
+}

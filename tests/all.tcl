@@ -684,6 +684,168 @@ a = [
 } -result 2
 
 
+# --- JSON reader ---
+test json-decode-scalars {json_decode scalars} -body {
+    ::tomltcl::json_decode {[1, -2.5e3, "x", true, false, null]}
+} -result {array {{number 1} {number -2.5e3} {string x} {bool 1} {bool 0} {null {}}}}
+
+test json-decode-object-order {object keys keep source order} -body {
+    ::tomltcl::json_decode { {"b": 1, "a": {"c": []}} }
+} -result {object {b {number 1} a {object {c {array {}}}}}}
+
+test json-decode-escapes {string escapes} -body {
+    lindex [::tomltcl::json_decode {"a\"b\\c\/\n\t\u00e9"}] 1
+} -result "a\"b\\c/\n\t\u00e9"
+
+test json-decode-surrogates {surrogate pair becomes one character in UTF-8} -body {
+    binary encode hex [encoding convertto utf-8 [lindex [::tomltcl::json_decode {"\ud83d\ude00"}] 1]]
+} -result f09f9880
+
+test json-decode-errors {malformed JSON is rejected with a position} -body {
+    set out {}
+    foreach bad {{[1,]} {{"a":1,"a":2}} {"\ud800"} {01} {[1] x} "\"a\x01\"" {} {{"a" 1}}} {
+        lappend out [catch {::tomltcl::json_decode $bad} err]
+    }
+    list $out [string match {JSON parse error at 1:4:*} [catch {::tomltcl::json_decode {[1,]}} e; set e]]
+} -result {{1 1 1 1 1 1 1 1} 1}
+
+# --- tagged JSON ---
+test tagged-scalars {to_tagged_json scalar tags} -body {
+    ::tomltcl::to_tagged_json [::tomltcl::parse {
+s = "x"
+i = 42
+f = 1e3
+b = true
+odt = 1979-05-27T07:32:00Z
+ldt = 1979-05-27T07:32:00
+ld = 1979-05-27
+lt = 07:32:00
+}]
+} -result {{"b":{"type":"bool","value":"true"},"f":{"type":"float","value":"1000.0"},"i":{"type":"integer","value":"42"},"ld":{"type":"date-local","value":"1979-05-27"},"ldt":{"type":"datetime-local","value":"1979-05-27T07:32:00"},"lt":{"type":"time-local","value":"07:32:00"},"odt":{"type":"datetime","value":"1979-05-27T07:32:00Z"},"s":{"type":"string","value":"x"}}}
+
+test tagged-special-floats {inf and nan keep their names} -body {
+    ::tomltcl::to_tagged_json [::tomltcl::parse "a = inf\nb = -inf\nc = nan\nd = -0.0"]
+} -result {{"a":{"type":"float","value":"inf"},"b":{"type":"float","value":"-inf"},"c":{"type":"float","value":"nan"},"d":{"type":"float","value":"-0.0"}}}
+
+test tagged-nesting {arrays and tables nest as plain JSON} -body {
+    ::tomltcl::to_tagged_json [::tomltcl::parse "a = \[\[1\], {x = 'y'}\]\n\[\[t\]\]\n\[\[t\]\]\nk = 1"]
+} -result {{"a":[[{"type":"integer","value":"1"}],{"x":{"type":"string","value":"y"}}],"t":[{},{"k":{"type":"integer","value":"1"}}]}}
+
+test tagged-roundtrip {from_tagged_json inverts to_tagged_json} -body {
+    set src {
+title = "TOML \u00e9"
+n = -17
+f = 6.02e23
+when = 1979-05-27T00:32:00.999999-07:00
+[db]
+ports = [ 8000, 8001 ]
+on = false
+[[db.replica]]
+host = "a"
+[[db.replica]]
+}
+    set doc [::tomltcl::parse $src]
+    set json [::tomltcl::to_tagged_json $doc]
+    expr {[::tomltcl::to_tagged_json [::tomltcl::from_tagged_json $json]] eq $json}
+} -result 1
+
+test tagged-pretty {pretty output is the same JSON} -body {
+    set doc [::tomltcl::parse "a = 1\n\[b\]\nc = \[1, 2\]"]
+    expr {[::tomltcl::json_decode [::tomltcl::to_tagged_json $doc -pretty 1]]
+          eq [::tomltcl::json_decode [::tomltcl::to_tagged_json $doc]]}
+} -result 1
+
+test tagged-validation {from_tagged_json rejects values TOML can't hold} -body {
+    set out {}
+    foreach bad {
+        {{"a": {"type": "integer", "value": "9223372036854775808"}}}
+        {{"a": {"type": "integer", "value": "1.5"}}}
+        {{"a": {"type": "float", "value": "abc"}}}
+        {{"a": {"type": "bool", "value": "yes"}}}
+        {{"a": {"type": "datetime", "value": "1979-05-27"}}}
+        {{"a": {"type": "date-local", "value": "1979-13-01"}}}
+        {{"a": {"type": "color", "value": "red"}}}
+        {{"a": 1}}
+        {[]}
+    } {
+        lappend out [catch {::tomltcl::from_tagged_json $bad}]
+    }
+    set out
+} -result {1 1 1 1 1 1 1 1 1}
+
+test tagged-int-bounds {64-bit integer limits survive} -body {
+    set doc [::tomltcl::from_tagged_json {{"lo": {"type": "integer", "value": "-9223372036854775808"}, "hi": {"type": "integer", "value": "9223372036854775807"}}}]
+    ::tomltcl::encode $doc
+} -result "hi = 9223372036854775807\nlo = -9223372036854775808\n"
+
+test tagged-encode-reparse {encode output of a tagged document parses back} -body {
+    set j {{"a": {"b": [{"c": {"type": "string", "value": "x\ny"}}, {}]}, "t": {"type": "time-local", "value": "07:32:00.5"}}}
+    set doc [::tomltcl::from_tagged_json $j]
+    expr {[::tomltcl::to_tagged_json [::tomltcl::parse [::tomltcl::encode $doc]]]
+          eq [::tomltcl::to_tagged_json $doc]}
+} -result 1
+
+# --- strict UTF-8 input ---
+test utf8-valid {decode_bytes accepts UTF-8 and skips a BOM} -body {
+    set s [::tomltcl::tv_data [dict get [::tomltcl::tv_data [::tomltcl::decode_bytes "\xEF\xBB\xBFa = \"\xC3\xA9\xF0\x9F\x98\x80\""]] a]]
+    binary encode hex [encoding convertto utf-8 $s]
+} -result c3a9f09f9880
+
+test utf8-errors {overlongs, surrogates, truncation and stray bytes are rejected} -body {
+    set out {}
+    foreach bad {"a = '\xC0\xAF'" "a = '\xED\xA0\x80'" "a = '\xF4\x90\x80\x80'"
+                 "a = '\xE2\x82'" "a = '\x80'" "a = '\xFF'"} {
+        lappend out [::tomltcl::utf8_error $bad]
+    }
+    set out
+} -result {5 5 5 5 5 5}
+
+test utf8-error-message {decode_bytes reports line and byte offset} -body {
+    catch {::tomltcl::decode_bytes "a = 1\nb = '\xFF'"} err
+    set err
+} -result {TOML parse error at line 2: invalid UTF-8 at byte offset 11}
+
+test unicode-escape-astral {\U escapes past U+FFFF encode to 4-byte UTF-8} -body {
+    binary encode hex [encoding convertto utf-8 [::tomltcl::tv_data [dict get [rootdict {a = "\U0001F600"}] a]]]
+} -result f09f9880
+
+# --- CLI decode / encode ---
+proc cli {args} {
+    set script [file join $::root tomltcl-cli.tcl]
+    set input ""
+    if {[lindex $args 0] eq "-input"} { set input [lindex $args 1]; set args [lrange $args 2 end] }
+    set f [open |[list [info nameofexecutable] $script {*}$args 2>@1] r+]
+    fconfigure $f -translation binary
+    puts -nonewline $f $input
+    close $f write
+    set out [read $f]
+    set code 0
+    if {[catch {close $f} err opts]} {
+        set ec [dict get $opts -errorcode]
+        if {[lindex $ec 0] eq "CHILDSTATUS"} { set code [lindex $ec 2] }
+    }
+    list $code [encoding convertfrom utf-8 $out]
+}
+
+test cli-decode {decode prints tagged JSON} -body {
+    lassign [cli -input "a = 1\nb = \[true\]\n" decode] code out
+    list $code [::tomltcl::json_decode $out]
+} -result {0 {object {a {object {type {string integer} value {string 1}}} b {array {{object {type {string bool} value {string true}}}}}}}}
+
+test cli-decode-invalid {decode exits 1 on invalid TOML} -body {
+    lassign [cli -input "a = \n" decode] code out
+    list $code [string match {TOML parse error at 1:*} $out]
+} -result {1 1}
+
+test cli-encode {encode turns tagged JSON into TOML} -body {
+    cli -input {{"t": {"x": {"type": "float", "value": "inf"}}, "a": {"type": "string", "value": "\u00e9"}}} encode
+} -result [list 0 "a = \"\u00e9\"\n\n\[t\]\nx = inf\n"]
+
+test cli-encode-invalid {encode rejects untagged JSON} -body {
+    lassign [cli -input {{"a": 1}} encode] code out
+    list $code [string trim $out]
+} -result {1 {a: bare JSON number is not a tagged value}}
+
 puts ""
 set ::_failed $::tcltest::numTests(Failed)
 cleanupTests
